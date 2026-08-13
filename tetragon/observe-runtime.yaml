@@ -1,0 +1,10 @@
+# Safe-by-default Tetragon observability policy: records process executions.
+# It deliberately contains no enforcement action. Promote policies to enforcement only after validation.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: observe-process-exec
+spec:
+  tracepoints:
+    - subsystem: sched
+      event: sched_process_exec
