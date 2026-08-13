@@ -1,6 +1,6 @@
 # AI-Driven Cloud-Native Security Platform
 
-Runnable interview/POC implementation of the architecture described in The Talent Grid project: telemetry collection, Kafka-compatible streaming, anomaly scoring, context generation, Zero-Trust policy decisions, staged enforcement, audit history, metrics, and Kubernetes/Tetragon deployment assets.
+Runnable implementation of the architecture described: telemetry collection, Kafka-compatible streaming, anomaly scoring, context generation, Zero-Trust policy decisions, staged enforcement, audit history, metrics, and Kubernetes/Tetragon deployment assets.
 
 ## Architecture
 
