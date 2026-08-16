@@ -1,85 +1,138 @@
+from __future__ import annotations
+
 import json
+import os
 import subprocess
-import asyncio
+import sys
+import time
+
 import httpx
-import uuid
 
-# Target Configuration parameters
-API_URL = "http://172.17.0.1:8080/v1/telemetry"
+API_URL = os.getenv("SOC_TETRAGON_URL", "http://127.0.0.1:8080/v1/tetragon")
+CLUSTER_NAME = os.getenv("CLUSTER_NAME", "security-demo")
+TETRAGON_NAMESPACE = os.getenv("TETRAGON_NAMESPACE", "kube-system")
+TETRAGON_LABEL = os.getenv("TETRAGON_LABEL", "app.kubernetes.io/name=tetragon")
+TETRAGON_CONTAINER = os.getenv("TETRAGON_CONTAINER", "export-stdout")
 
-def map_tetragon_to_schema(raw_line):
-    """
-    Extracts raw Tetragon JSON and reformats it to match your 
-    Security API's TelemetryEvent data model.
-    """
-    try:
-        event_data = json.loads(raw_line)
-        
-        # We only care about process execution events caught by your policy
-        process_info = event_data.get("process_exec", {}).get("process", {})
-        if not process_info:
-            return None
-            
-        # Parse attributes out of the raw kernel structures
-        binary_name = process_info.get("binary", "unknown")
-        arguments = process_info.get("arguments", "")
-        pod_metadata = process_info.get("pod", {})
-        
-        # Intentionally detect security flags based on process names
-        is_malicious = "unknown-shell" in binary_name or "curl" in binary_name
 
-        # Structure the payload data to perfectly match the API expectations
-        payload = {
-            "event_id": str(uuid.uuid4()),
-            "event_type": "process",
-            "source_ip": pod_metadata.get("pod_ip", "127.0.0.1"),
-            "destination_ip": "203.0.113.66" if is_malicious else "10.20.0.1",
-            "destination_port": 4444 if is_malicious else 80,
-            "process": binary_name,
-            "user": process_info.get("user", "unknown"),
-            "namespace": pod_metadata.get("namespace", "default"),
-            "bytes_out": 90000000 if is_malicious else 1024,
-            "failed_auth_count": 0,
-            "privileged": process_info.get("cap_effective", False),
-            "known_bad_ioc": is_malicious
-        }
-        return payload
-    except Exception:
-        return None
+def kubectl_command() -> list[str]:
+    """
+    Start at the current end of the Tetragon log.
 
-async def stream_and_forward():
+    --tail=0 is important: without it kubectl can replay older events before
+    reaching the command that the SOC analyst just executed.
     """
-    Spawns a shell stream to read Tetragon logs and forwards 
-    the transformed blocks over HTTPX.
-    """
-    # Build the exact command pipeline to pull raw JSON data lines
-    cmd = "kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -c export-stdout -f"
-    
-    print("⏳ Starting Tetragon Adapter Loop... Listening to kernel tracepoints...")
-    
-    # Open an active non-blocking stream process pipe
-    process = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
+    return [
+        "kubectl",
+        "logs",
+        "-n",
+        TETRAGON_NAMESPACE,
+        "-l",
+        TETRAGON_LABEL,
+        "-c",
+        TETRAGON_CONTAINER,
+        "--tail=0",
+        "--max-log-requests=20",
+        "-f",
+    ]
+
+
+def forward(client: httpx.Client, event: dict) -> None:
+    """Forward the untouched Tetragon JSON. Never invent security fields."""
+    response = client.post(
+        API_URL,
+        params={"cluster": CLUSTER_NAME},
+        json=event,
     )
-    
-    async with httpx.AsyncClient(timeout=5) as client:
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-                
-            decoded_line = line.decode('utf-8').strip()
-            mapped_payload = map_tetragon_to_schema(decoded_line)
-            
-            if mapped_payload:
+    response.raise_for_status()
+
+    key = next(
+        (
+            name
+            for name in (
+                "process_exec",
+                "process_exit",
+                "process_kprobe",
+                "process_tracepoint",
+                "process_uprobe",
+                "process_loader",
+                "process_lsm",
+            )
+            if isinstance(event.get(name), dict)
+        ),
+        "unknown",
+    )
+    block = event.get(key) or {}
+    process_info = block.get("process") or {}
+    binary = process_info.get("binary") or "-"
+    arguments = process_info.get("arguments") or process_info.get("args") or ""
+    print(
+        f"Forwarded {key}: {binary} {arguments} -> {response.status_code}",
+        flush=True,
+    )
+
+
+def run_once() -> int:
+    command = kubectl_command()
+    print("Starting raw Tetragon realtime forwarder", flush=True)
+    print("Command:", " ".join(command), flush=True)
+    print("SOC endpoint:", API_URL, flush=True)
+    print("Cluster:", CLUSTER_NAME, flush=True)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    assert process.stdout is not None
+
+    with httpx.Client(timeout=5.0) as client:
+        try:
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+
                 try:
-                    # Fire off the post request asynchronously 
-                    response = await client.post(API_URL, json=mapped_payload)
-                    print(f"📡 Forwarded Event: {mapped_payload['process']} -> Status: {response.status_code}")
-                except Exception as e:
-                    print(f"⚠️ Network error connecting to Security API: {e}")
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Ignore non-JSON kubectl/log noise rather than creating a
+                    # fake event from it.
+                    continue
+
+                try:
+                    forward(client, event)
+                except Exception as exc:
+                    print(f"Forward error: {exc}", file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            print("Stopping Tetragon forwarder...", flush=True)
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            return 0
+
+    stderr = ""
+    if process.stderr is not None:
+        stderr = process.stderr.read().strip()
+    code = process.wait()
+    if stderr:
+        print(stderr, file=sys.stderr, flush=True)
+    return code
+
+
+def main() -> None:
+    while True:
+        code = run_once()
+        if code == 0:
+            return
+        print(f"kubectl log stream ended with code {code}; reconnecting in 2s", flush=True)
+        time.sleep(2)
+
 
 if __name__ == "__main__":
-    asyncio.run(stream_and_forward())
+    main()
