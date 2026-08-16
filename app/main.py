@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio,json,os
 from contextlib import asynccontextmanager
-from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiokafka import AIOKafkaConsumer,AIOKafkaProducer
 from fastapi import Body,FastAPI,HTTPException,Query
@@ -96,6 +95,13 @@ async def tetragon(raw:dict=Body(...),cluster:str|None=Query(default=None)):
         return {"accepted":True,"event_id":event.event_id,"pipeline":"kafka"}
     d=await evaluate(event)
     return {"accepted":True,"event_id":event.event_id,"pipeline":"direct","risk":d.anomaly_score}
+
+@app.post("/v1/telemetry")
+async def telemetry(event:TelemetryEvent):
+    if producer is not None:
+        await producer.send_and_wait(TOPIC,event.model_dump_json().encode())
+        return {"accepted":True,"event_id":event.event_id,"pipeline":"kafka"}
+    return await evaluate(event)
 
 @app.get("/v1/detections")
 def detections(limit:int=100):
