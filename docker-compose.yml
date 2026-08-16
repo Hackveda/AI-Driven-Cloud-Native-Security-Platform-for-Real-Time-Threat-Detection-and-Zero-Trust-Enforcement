@@ -21,6 +21,9 @@ services:
       USE_KAFKA: "true"
       ENFORCEMENT_MODE: simulate
       DB_PATH: /data/security.db
+      OLLAMA_HOST: http://172.17.0.1:11434
+    extra_hosts: 
+      - "host.docker.internal:host-gateway"
     volumes: ["security_data:/data"]
     ports: ["8080:8080"]
     depends_on: {redpanda: {condition: service_healthy}}

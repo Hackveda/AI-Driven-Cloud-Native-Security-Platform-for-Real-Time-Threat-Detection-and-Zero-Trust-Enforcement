@@ -5,7 +5,7 @@ import httpx
 import uuid
 
 # Target Configuration parameters
-API_URL = "http://localhost:8080/v1/telemetry"
+API_URL = "http://172.17.0.1:8080/v1/telemetry"
 
 def map_tetragon_to_schema(raw_line):
     """

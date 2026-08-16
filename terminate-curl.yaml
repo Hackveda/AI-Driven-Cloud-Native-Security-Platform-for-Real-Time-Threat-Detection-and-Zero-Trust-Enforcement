@@ -1,0 +1,23 @@
+apiVersion: cilium.io/v1alpha1
+
+kind: TracingPolicy
+
+metadata:
+  name: block-curl-execution
+  namespace: default
+
+spec:
+  kprobes:
+    - call: "sys_execve"
+      syscall: true
+      args: 
+        - index: 0
+          type: "string"  # Extract the binary filename
+      selectors:
+        - matchArgs:
+            - index: 0
+              operator: "Equal"
+              values:
+                - "/usr/bin/curl"
+          matchActions:
+            - action: "Sigkill"  # Instantly terminates the process

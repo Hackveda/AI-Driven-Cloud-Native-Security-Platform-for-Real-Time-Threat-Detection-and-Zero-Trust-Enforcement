@@ -7,3 +7,4 @@ numpy==2.3.2
 prometheus-client==0.22.1
 httpx==0.28.1
 pytest==8.4.1
+ollama
