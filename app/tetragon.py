@@ -115,7 +115,6 @@ def _network(obj: Any) -> dict[str, Any]:
                 if port and 0 < port <= 65535:
                     out.setdefault("source_port", port)
 
-            # Tetragon sock payloads can use nested destination/source objects.
             for key in ("destination", "dst", "remote"):
                 nested = lower.get(key)
                 if isinstance(nested, dict):
@@ -168,7 +167,7 @@ def normalize_tetragon_event(
     net = _network(block) if key in {"process_kprobe", "process_tracepoint"} else {}
 
     destination_host, command_port = _host_from_command(binary, arguments)
-    destination_port = net.get("destination_port") or command_port if net.get("destination_ip") else net.get("destination_port")
+    destination_port = net.get("destination_port") or command_port
 
     if key == "process_exec":
         kernel_activity = ["execve"]
