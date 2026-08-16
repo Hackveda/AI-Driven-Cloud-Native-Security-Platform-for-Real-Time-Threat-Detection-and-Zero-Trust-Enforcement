@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: tetragon-soc-collector, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: tetragon-soc-collector, namespace: kube-system}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get","list","watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: tetragon-soc-collector, namespace: kube-system}
+subjects:
+- {kind: ServiceAccount, name: tetragon-soc-collector, namespace: kube-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: tetragon-soc-collector}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tetragon-soc-collector, namespace: kube-system}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: tetragon-soc-collector}}
+  template:
+    metadata: {labels: {app: tetragon-soc-collector}}
+    spec:
+      serviceAccountName: tetragon-soc-collector
+      containers:
+      - name: collector
+        image: your-registry/ai-security-platform:2.0.0
+        imagePullPolicy: IfNotPresent
+        command: ["python","/app/collector/tetragon_collector.py"]
+        env:
+        - {name: SOC_API_URL, value: "http://security-api.default.svc.cluster.local/v1/tetragon"}
+        - {name: CLUSTER_NAME, value: "security-demo"}
+        - {name: TETRAGON_NAMESPACE, value: "kube-system"}
+        - {name: TETRAGON_CONTAINER, value: "export-stdout"}
