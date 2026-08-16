@@ -1,0 +1,18 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: connect
+spec:
+  kprobes:
+  - call: tcp_connect
+    syscall: false
+    message: "TCP connection initiated"
+    tags: ["soc","network"]
+    args:
+    - {index: 0, type: sock}
+  - call: tcp_close
+    syscall: false
+    message: "TCP connection closed"
+    tags: ["soc","network"]
+    args:
+    - {index: 0, type: sock}
