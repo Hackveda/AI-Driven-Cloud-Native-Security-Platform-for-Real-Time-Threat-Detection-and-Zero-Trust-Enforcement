@@ -30,6 +30,7 @@ EVENTS = Counter("security_events_total", "Telemetry events processed", ["type",
 LATENCY = Histogram("security_pipeline_seconds", "Fast scoring pipeline latency")
 ACTIONS = Counter("security_actions_total", "Policy actions", ["action", "status"])
 
+# All fast-path work remains deterministic. Ollama is enrichment only.
 detector = RiskEngine()
 analyzer = ContextAnalyzer()
 policy = PolicyEngine()
@@ -39,6 +40,12 @@ producer: AIOKafkaProducer | None = None
 consumer_task: asyncio.Task | None = None
 subscribers: set[asyncio.Queue] = set()
 ollama_tasks: set[asyncio.Task] = set()
+
+# Runtime correlation state. Tetragon PROCESS_EXEC and tcp_connect events contain
+# the same process exec_id, so we can enrich one SOC card rather than showing
+# disconnected process/network records.
+latest_by_exec_id: dict[str, Detection] = {}
+event_versions: dict[str, int] = {}
 
 
 def ist_time(dt) -> str:
@@ -80,9 +87,62 @@ def action_status(action: str, approval_required: bool) -> str:
 def immediate_summary(event: TelemetryEvent, risk: float, reasons: list[str], action: str) -> str:
     command = " ".join(x for x in [event.binary, event.args] if x).strip() or "runtime activity"
     if risk < 0.35:
-        return f"{command} was observed by Tetragon. Initial scoring found no elevated-risk indicators; Ollama analysis is being generated."
+        return (
+            f"{command} was captured by Tetragon. The event is available immediately; "
+            "Ollama is generating additional analyst context in the background."
+        )
     why = "; ".join(reasons[:2])
-    return f"{command} was observed by Tetragon. Initial risk is {risk:.2f}/1.00 because {why} Ollama analysis is being generated."
+    return (
+        f"{command} was captured by Tetragon. Initial risk is {round(risk * 100)}/100 "
+        f"because {why} Ollama analysis is being generated in the background."
+    )
+
+
+def merge_unique(first: list[str], second: list[str]) -> list[str]:
+    return list(dict.fromkeys([*first, *second]))
+
+
+def correlate_runtime_event(event: TelemetryEvent) -> TelemetryEvent:
+    """
+    Merge a network/kernel event into its earlier PROCESS_EXEC when exec_id matches.
+
+    This is what turns:
+        PROCESS_EXEC curl -I https://hackveda.in
+        PROCESS_KPROBE tcp_connect -> 1.2.3.4:443
+    into one SOC card with command + destination + kernel activity.
+    """
+    if not event.exec_id or event.event_type == "process":
+        return event
+
+    previous = latest_by_exec_id.get(event.exec_id)
+    if previous is None:
+        return event
+
+    base = previous.event.model_copy(deep=True)
+
+    if event.source_ip:
+        base.source_ip = event.source_ip
+    if event.destination_ip:
+        base.destination_ip = event.destination_ip
+    if event.source_port:
+        base.source_port = event.source_port
+    if event.destination_port:
+        base.destination_port = event.destination_port
+    if event.destination_host:
+        base.destination_host = event.destination_host
+    if event.protocol:
+        base.protocol = event.protocol
+    if event.syscall:
+        base.syscall = event.syscall
+    if event.policy_name:
+        base.policy_name = event.policy_name
+
+    base.tags = merge_unique(base.tags, event.tags)
+    base.kernel_activity = merge_unique(base.kernel_activity, event.kernel_activity)
+
+    # Preserve the process_exec event ID so SSE updates the same browser card.
+    # Keep original process timestamp; the network event is evidence enriching it.
+    return base
 
 
 async def enrich_with_ollama(
@@ -92,10 +152,9 @@ async def enrich_with_ollama(
     reasons: list[str],
     decision,
     status: str,
+    version: int,
 ) -> None:
     try:
-        # Critical fix: the Ollama SDK is synchronous. Run it in a worker thread
-        # so the Kafka consumer and SSE event loop never wait for LLM inference.
         summary, source = await asyncio.to_thread(
             analyzer.summarize,
             event,
@@ -104,6 +163,11 @@ async def enrich_with_ollama(
             decision.action,
             factors,
         )
+
+        # A newer correlated event may have arrived while Ollama was working.
+        # Never let stale AI output overwrite a newer card with richer evidence.
+        if event_versions.get(event.event_id) != version:
+            return
 
         detection = Detection(
             event=event,
@@ -117,17 +181,23 @@ async def enrich_with_ollama(
             explanation_source=source,
         )
         store.save(detection)
+        if event.exec_id:
+            latest_by_exec_id[event.exec_id] = detection
         await broadcast_payload(soc_payload(detection, "final"))
     except Exception as exc:
         print(f"ollama enrichment failed for {event.event_id}: {exc}", flush=True)
 
 
 async def evaluate(event: TelemetryEvent) -> Detection:
-    """Fast path: score, store, and broadcast before Ollama runs."""
+    """Score/store/broadcast immediately, then run Ollama asynchronously."""
     with LATENCY.time():
+        event = correlate_runtime_event(event)
         risk, factors, reasons = detector.score(event)
         decision = policy.decide(event, risk)
         status = action_status(decision.action, decision.approval_required)
+
+        version = event_versions.get(event.event_id, 0) + 1
+        event_versions[event.event_id] = version
 
         pending = Detection(
             event=event,
@@ -141,14 +211,24 @@ async def evaluate(event: TelemetryEvent) -> Detection:
             explanation_source="deterministic",
         )
 
-        # Persist and push immediately. This is the event the UI sees first.
         store.save(pending)
+        if event.exec_id:
+            latest_by_exec_id[event.exec_id] = pending
+
         EVENTS.labels(event.event_type, decision.severity).inc()
         ACTIONS.labels(decision.action, status).inc()
         await broadcast_payload(soc_payload(pending, "pending_ai"))
 
         task = asyncio.create_task(
-            enrich_with_ollama(event, risk, factors, reasons, decision, status)
+            enrich_with_ollama(
+                event,
+                risk,
+                factors,
+                reasons,
+                decision,
+                status,
+                version,
+            )
         )
         ollama_tasks.add(task)
         task.add_done_callback(ollama_tasks.discard)
@@ -159,7 +239,7 @@ async def consume_loop() -> None:
     consumer = AIOKafkaConsumer(
         TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id="security-detector-v3-instant",
+        group_id="security-detector-v4-correlated",
         auto_offset_reset="latest",
         enable_auto_commit=True,
     )
@@ -167,8 +247,6 @@ async def consume_loop() -> None:
     try:
         async for msg in consumer:
             try:
-                # evaluate() no longer waits for Ollama, so the consumer can keep
-                # draining Tetragon events at full speed.
                 await evaluate(TelemetryEvent.model_validate_json(msg.value))
             except Exception as exc:
                 print("bad event:", exc, flush=True)
@@ -202,20 +280,21 @@ async def lifespan(app: FastAPI):
         await producer.stop()
 
 
-app = FastAPI(title="Tetragon AI SOC", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Tetragon AI SOC", version="4.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "kafka": bool(producer),
         "topic": TOPIC,
         "enforcement_mode": ENFORCEMENT_MODE,
         "timezone": "Asia/Kolkata",
         "streaming": "SSE",
         "ollama_mode": "asynchronous_enrichment",
+        "tetragon_correlation": "exec_id",
     }
 
 
@@ -233,12 +312,19 @@ async def tetragon(raw: dict = Body(...), cluster: str | None = Query(default=No
 
     if producer is not None:
         await producer.send_and_wait(TOPIC, event.model_dump_json().encode())
-        return {"accepted": True, "event_id": event.event_id, "pipeline": "kafka"}
+        return {
+            "accepted": True,
+            "event_id": event.event_id,
+            "exec_id": event.exec_id,
+            "tetragon_event_type": event.tetragon_event_type,
+            "pipeline": "kafka",
+        }
 
     detection = await evaluate(event)
     return {
         "accepted": True,
-        "event_id": event.event_id,
+        "event_id": detection.event.event_id,
+        "exec_id": detection.event.exec_id,
         "pipeline": "direct",
         "risk": detection.anomaly_score,
     }
@@ -246,6 +332,7 @@ async def tetragon(raw: dict = Body(...), cluster: str | None = Query(default=No
 
 @app.post("/v1/telemetry")
 async def telemetry(event: TelemetryEvent):
+    """Compatibility endpoint for already-normalized events."""
     if producer is not None:
         await producer.send_and_wait(TOPIC, event.model_dump_json().encode())
         return {"accepted": True, "event_id": event.event_id, "pipeline": "kafka"}
@@ -270,7 +357,7 @@ async def stream():
 
     async def generate():
         try:
-            yield ": connected\n\n"
+            yield "retry: 1000\n: connected\n\n"
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=10)
@@ -299,7 +386,10 @@ def metrics():
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return HTMLResponse(r'''<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Tetragon AI Security Operations Center</title>
 <style>
 :root{--bg:#06101c;--panel:#0d1929;--line:#203650;--text:#edf5ff;--muted:#8299b7;--green:#41df9b;--yellow:#ffd166;--orange:#ff984f;--red:#ff5570;--blue:#63b4ff}
@@ -308,30 +398,38 @@ header{display:flex;justify-content:space-between;align-items:center;gap:20px;ma
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}.stat,.event{background:linear-gradient(145deg,#101e31,#091522);border:1px solid var(--line);border-radius:14px}.stat{padding:14px}.label{font-size:10px;color:var(--muted);letter-spacing:.9px;text-transform:uppercase}.number{font-size:26px;font-weight:900;margin-top:5px}
 .toolbar{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}button,input{background:#091625;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 11px}button{color:var(--muted);cursor:pointer}button.on{background:#15365c;color:#c5e4ff;border-color:#3a6fa5}input{margin-left:auto;min-width:330px}
 .feed{display:grid;gap:10px}.event{position:relative;overflow:hidden;padding:16px 18px 16px 20px}.event:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--green)}.event.medium:before{background:var(--yellow)}.event.high:before{background:var(--orange)}.event.critical:before{background:var(--red)}
-.eventhead{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.time{font-size:18px;font-weight:900}.phase{font-size:10px;color:var(--blue);letter-spacing:.8px}.grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:9px}.field{background:#091524;border:1px solid #1b3049;border-radius:9px;padding:10px;min-height:66px}.field.wide{grid-column:span 2}.field.full{grid-column:1/-1}.value{font-size:13px;line-height:1.42;margin-top:5px;word-break:break-word}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.ai{background:linear-gradient(135deg,#0c1d32,#0b1728);border-color:#28517a}.ai .label{color:#74bcff}.riskrow{display:grid;grid-template-columns:1fr 1fr;gap:9px}.risknum{font-size:30px;font-weight:900}.severity{font-size:22px;font-weight:900}.lowtxt{color:var(--green)}.mediumtxt{color:var(--yellow)}.hightxt{color:var(--orange)}.criticaltxt{color:var(--red)}.bar{height:7px;background:#17283d;border-radius:10px;overflow:hidden;margin-top:8px}.fill{height:100%}.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:10px}.chip{font-size:10px;color:#afc4de;border:1px solid #243c57;border-radius:6px;padding:4px 6px}.foot{font-size:10px;color:var(--muted);margin-top:10px}.empty{padding:55px;text-align:center;color:var(--muted)}
-@media(max-width:1000px){.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.wrap{padding:12px}.grid{grid-template-columns:1fr}.field.wide,.field.full{grid-column:auto}.riskrow{grid-template-columns:1fr}.eventhead,header{align-items:flex-start;flex-direction:column}input{margin-left:0;min-width:100%}}
-</style></head><body><div class="wrap">
-<header><div><h1>Tetragon AI Security Operations Center</h1><div class="sub">Instant Kubernetes runtime telemetry · asynchronous Ollama enrichment · explainable risk · IST</div></div><div class="live" id="live">● CONNECTING</div></header>
+.eventhead{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.time{font-size:18px;font-weight:900}.phase{font-size:10px;color:var(--blue);letter-spacing:.8px}.grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:9px}.field{background:#091524;border:1px solid #1b3049;border-radius:9px;padding:10px;min-height:66px}.field.wide{grid-column:span 2}.field.full{grid-column:1/-1}.value{font-size:13px;line-height:1.42;margin-top:5px;word-break:break-word}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.ai{background:linear-gradient(135deg,#0c1d32,#0b1728);border-color:#28517a}.ai .label{color:#74bcff}.risknum{font-size:30px;font-weight:900}.severity{font-size:22px;font-weight:900}.lowtxt{color:var(--green)}.mediumtxt{color:var(--yellow)}.hightxt{color:var(--orange)}.criticaltxt{color:var(--red)}.bar{height:7px;background:#17283d;border-radius:10px;overflow:hidden;margin-top:8px}.fill{height:100%}.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:10px}.chip{font-size:10px;color:#afc4de;border:1px solid #243c57;border-radius:6px;padding:4px 6px}.foot{font-size:10px;color:var(--muted);margin-top:10px}.empty{padding:55px;text-align:center;color:var(--muted)}
+@media(max-width:1000px){.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.wrap{padding:12px}.grid{grid-template-columns:1fr}.field.wide,.field.full{grid-column:auto}.eventhead,header{align-items:flex-start;flex-direction:column}input{margin-left:0;min-width:100%}}
+</style>
+</head>
+<body><div class="wrap">
+<header><div><h1>Tetragon AI Security Operations Center</h1><div class="sub">Raw Tetragon telemetry · exec/network correlation · instant SSE · background Ollama · IST</div></div><div class="live" id="live">● CONNECTING</div></header>
 <div class="stats"><div class="stat"><div class="label">Events</div><div class="number" id="n">0</div></div><div class="stat"><div class="label">Critical</div><div class="number" id="c">0</div></div><div class="stat"><div class="label">High</div><div class="number" id="h">0</div></div><div class="stat"><div class="label">Needs Action</div><div class="number" id="a">0</div></div><div class="stat"><div class="label">Average Risk</div><div class="number" id="avg">0</div></div></div>
-<div class="toolbar"><button class="on" data-f="all">All</button><button data-f="critical">Critical</button><button data-f="high">High</button><button data-f="medium">Medium</button><button data-f="low">Low</button><input id="q" placeholder="Search user, process, command, pod, node, destination…"></div><div id="feed" class="feed"></div></div>
+<div class="toolbar"><button class="on" data-f="all">All</button><button data-f="critical">Critical</button><button data-f="high">High</button><button data-f="medium">Medium</button><button data-f="low">Low</button><input id="q" placeholder="Search user, process, command, pod, node, destination…"></div>
+<div id="feed" class="feed"></div></div>
 <script>
-let D=[],F="all";const esc=v=>String(v??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
-function basename(p){if(!p)return"unknown";let x=String(p).split("/");return x[x.length-1]||p}function command(e){return [e.binary,e.args].filter(Boolean).join(" ")||"unknown"}
-function user(e){if(e.user)return e.user;if(e.uid===0)return"root";if(e.uid!==null&&e.uid!==undefined)return`UID ${e.uid}`;return"unknown"}
-function kernel(e){let t=e.tetragon_event_type||e.event_type;if(e.destination_ip)return"execve → socket → connect";if(t==="process_exec")return"execve";if(t==="process_exit")return"process exit";if(t==="process_kprobe")return e.syscall?`kprobe → ${e.syscall}`:"kprobe";if(t==="process_tracepoint")return e.syscall?`tracepoint → ${e.syscall}`:"tracepoint";return t||"runtime event"}
-function destination(e){return e.destination_ip?`${e.destination_ip}${e.destination_port?":"+e.destination_port:""}`:"Not present in this event"}
-function eventName(e){if(e.destination_ip)return"Outbound command execution";if(e.tetragon_event_type==="process_exec")return"Process execution";if(e.tetragon_event_type==="process_exit")return"Process exit";return (e.tetragon_event_type||e.event_type||"Runtime event").replaceAll("_"," ")}
-function color(r){return r>=80?"#ff5570":r>=65?"#ff984f":r>=35?"#ffd166":"#41df9b"}function cls(s){return s+"txt"}
+let D=[],F="all";
+const esc=v=>String(v??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
+function basename(p){if(!p)return"unknown";let x=String(p).split("/");return x[x.length-1]||p}
+function command(e){return [e.binary,e.args].filter(Boolean).join(" ")||"unknown"}
+function user(e){if(e.username)return e.uid!==null&&e.uid!==undefined?`${e.username} (UID ${e.uid})`:e.username;if(e.uid===0)return"root (UID 0)";if(e.uid!==null&&e.uid!==undefined)return`UID ${e.uid}`;return"unknown"}
+function kernel(e){let k=Array.isArray(e.kernel_activity)?e.kernel_activity.filter(Boolean):[];if(k.length)return k.join(" → ");let t=e.tetragon_event_type||e.event_type;return t==="process_exec"?"execve":t||"runtime event"}
+function destination(e){let host=e.destination_host||"";let port=e.destination_port?":"+e.destination_port:"";if(host&&e.destination_ip)return`${host}${port} (${e.destination_ip})`;if(host)return`${host}${port}`;if(e.destination_ip)return`${e.destination_ip}${port}`;return"None observed"}
+function eventName(e){let cmd=command(e).toLowerCase();if(e.destination_ip||e.destination_host)return"Outbound command execution";if(cmd.includes("/etc/passwd")||cmd.includes("/etc/shadow")||cmd.includes("/.ssh/")||cmd.includes("/var/run/secrets/kubernetes.io"))return"Sensitive file access command";if(e.tetragon_event_type==="process_exec")return"Process execution";if(e.tetragon_event_type==="process_exit")return"Process exit";return (e.tetragon_event_type||e.event_type||"Runtime event").replaceAll("_"," ")}
+function color(r){return r>=80?"#ff5570":r>=65?"#ff984f":r>=35?"#ffd166":"#41df9b"}
+function cls(s){return s+"txt"}
 function visible(x){if(F!=="all"&&x.severity!==F)return false;let s=q.value.trim().toLowerCase();if(!s)return true;return (JSON.stringify(x.event)+" "+x.context_summary).toLowerCase().includes(s)}
 function upsert(x){let i=D.findIndex(v=>v.event?.event_id===x.event?.event_id);if(i>=0)D[i]=x;else D.unshift(x);if(D.length>500)D.length=500;render()}
 function render(){let z=D.filter(visible);n.textContent=z.length;c.textContent=z.filter(x=>x.severity==="critical").length;h.textContent=z.filter(x=>x.severity==="high").length;a.textContent=z.filter(x=>["alert","quarantine","block"].includes(x.recommended_action)).length;avg.textContent=z.length?Math.round(z.reduce((s,x)=>s+Number(x.risk_score_100??x.anomaly_score*100),0)/z.length):0;
-feed.innerHTML=z.map(x=>{let e=x.event||{},r=Number(x.risk_score_100??Math.round(Number(x.anomaly_score||0)*100)),pending=x.phase==="pending_ai";let factors=(x.risk_factors||[]).map(f=>`<span class="chip" title="${esc(f.evidence)}">${esc(f.label)} +${Math.round(Number(f.weight)*100)}</span>`).join("");return `<article class="event ${esc(x.severity)}"><div class="eventhead"><div><div class="time">${esc(x.timestamp_ist||e.timestamp)}</div><div class="phase">${pending?"EVENT RECEIVED · OLLAMA ANALYSIS IN PROGRESS":"EVENT ANALYZED"}</div></div><div class="severity ${cls(x.severity)}">${esc(x.severity.toUpperCase())}</div></div><div class="grid">
+feed.innerHTML=z.map(x=>{let e=x.event||{},r=Number(x.risk_score_100??Math.round(Number(x.anomaly_score||0)*100)),pending=x.phase==="pending_ai";let factors=(x.risk_factors||[]).map(f=>`<span class="chip" title="${esc(f.evidence)}">${esc(f.label)} +${Math.round(Number(f.weight)*100)}</span>`).join("");return `<article class="event ${esc(x.severity)}"><div class="eventhead"><div><div class="time">${esc(x.timestamp_ist||e.timestamp)}</div><div class="phase">${pending?"EVENT RECEIVED · OLLAMA IN PROGRESS":"EVENT ANALYZED"}</div></div><div class="severity ${cls(x.severity)}">${esc(x.severity.toUpperCase())}</div></div><div class="grid">
 <div class="field wide"><div class="label">Event</div><div class="value">${esc(eventName(e))}</div></div><div class="field"><div class="label">User</div><div class="value">${esc(user(e))}</div></div><div class="field"><div class="label">Parent</div><div class="value mono">${esc(basename(e.parent_binary))}</div></div>
 <div class="field"><div class="label">Process</div><div class="value mono">${esc(e.binary||"unknown")}</div></div><div class="field wide"><div class="label">Command</div><div class="value mono">${esc(command(e))}</div></div><div class="field"><div class="label">Kernel Activity</div><div class="value mono">${esc(kernel(e))}</div></div>
 <div class="field wide"><div class="label">Destination</div><div class="value mono">${esc(destination(e))}</div></div><div class="field"><div class="label">Pod / Namespace</div><div class="value">${esc((e.pod_name||"-")+" / "+(e.namespace||"-"))}</div></div><div class="field"><div class="label">Node</div><div class="value">${esc(e.node_name||"-")}</div></div>
 <div class="field full ai"><div class="label">✦ Ollama Analysis</div><div class="value">${pending?'<span style="color:#7ebcff">Analyzing event asynchronously…</span><br>':''}${esc(x.context_summary||"")}</div></div>
 <div class="field wide"><div class="label">Risk Score</div><div class="risknum" style="color:${color(r)}">${r} / 100</div><div class="bar"><div class="fill" style="width:${r}%;background:${color(r)}"></div></div></div><div class="field wide"><div class="label">Severity</div><div class="severity ${cls(x.severity)}">${esc(x.severity.toUpperCase())}</div><div class="value">Recommended action: ${esc((x.recommended_action||"").toUpperCase())}</div></div>
-</div><div class="chips">${factors}</div><div class="foot">Cluster: ${esc(e.cluster_name||"-")} · Event ID: ${esc(e.event_id||"-")} · Enforcement: ${esc(x.enforcement_status||"-")}</div></article>`}).join("")||'<div class="stat empty">Waiting for Tetragon events…</div>'}
+</div><div class="chips">${factors}</div><div class="foot">Cluster: ${esc(e.cluster_name||"-")} · Exec ID: ${esc(e.exec_id||"-")} · Event ID: ${esc(e.event_id||"-")} · Enforcement: ${esc(x.enforcement_status||"-")}</div></article>`}).join("")||'<div class="stat empty">Waiting for Tetragon events…</div>'}
 document.querySelectorAll("button[data-f]").forEach(b=>b.onclick=()=>{document.querySelectorAll("button[data-f]").forEach(x=>x.classList.remove("on"));b.classList.add("on");F=b.dataset.f;render()});q.oninput=render;
-fetch("/v1/detections?limit=150",{cache:"no-store"}).then(r=>r.json()).then(x=>{D=x;render()});const stream=new EventSource("/v1/stream");stream.onopen=()=>live.textContent="● LIVE";stream.onerror=()=>live.textContent="● RECONNECTING";stream.onmessage=e=>upsert(JSON.parse(e.data));
-</script></body></html>''')
+fetch("/v1/detections?limit=150",{cache:"no-store"}).then(r=>r.json()).then(x=>{D=x;render()});
+const stream=new EventSource("/v1/stream");stream.onopen=()=>live.textContent="● LIVE";stream.onerror=()=>live.textContent="● RECONNECTING";stream.onmessage=e=>upsert(JSON.parse(e.data));
+</script>
+</body></html>''')
