@@ -1,43 +1,109 @@
 from __future__ import annotations
-import json,os,time,threading
+
+import json
+import os
+import threading
+import time
+
 import httpx
-from kubernetes import client,config
+from kubernetes import client, config
 
-API=os.getenv("SOC_API_URL","http://security-api.default.svc.cluster.local/v1/tetragon")
-NS=os.getenv("TETRAGON_NAMESPACE","kube-system")
-LABEL=os.getenv("TETRAGON_LABEL","app.kubernetes.io/name=tetragon")
-CONTAINER=os.getenv("TETRAGON_CONTAINER","export-stdout")
-CLUSTER=os.getenv("CLUSTER_NAME","kubernetes-cluster")
+SOC_API_URL = os.getenv(
+    "SOC_API_URL",
+    "http://security-api.default.svc.cluster.local/v1/tetragon",
+)
+TETRAGON_NAMESPACE = os.getenv("TETRAGON_NAMESPACE", "kube-system")
+TETRAGON_LABEL = os.getenv(
+    "TETRAGON_LABEL",
+    "app.kubernetes.io/name=tetragon",
+)
+TETRAGON_CONTAINER = os.getenv("TETRAGON_CONTAINER", "export-stdout")
+CLUSTER_NAME = os.getenv("CLUSTER_NAME", "kubernetes-cluster")
 
-def cfg():
-    try:config.load_incluster_config()
-    except config.ConfigException:config.load_kube_config()
 
-def stream_pod(name):
-    api=client.CoreV1Api()
-    with httpx.Client(timeout=10) as http:
+def load_config() -> None:
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        config.load_kube_config()
+
+
+def stream_pod(pod_name: str) -> None:
+    api = client.CoreV1Api()
+    print(f"Streaming live Tetragon events from {pod_name}", flush=True)
+
+    with httpx.Client(timeout=5.0) as http:
         while True:
             try:
-                log=api.read_namespaced_pod_log(name=name,namespace=NS,container=CONTAINER,follow=True,timestamps=False,_preload_content=False)
-                for raw in log.stream():
-                    try:
-                        e=json.loads(raw.decode(errors="replace").strip()); e["_soc_cluster_name"]=CLUSTER
-                        http.post(API,json=e).raise_for_status()
-                    except json.JSONDecodeError:pass
-                    except Exception as ex:print(name,ex,flush=True)
-            except Exception as ex:
-                print(f"{name} stream reconnect: {ex}",flush=True); time.sleep(3)
+                # tail_lines=0 prevents replaying old Tetragon history. The SOC
+                # receives only events produced after this stream starts.
+                response = api.read_namespaced_pod_log(
+                    name=pod_name,
+                    namespace=TETRAGON_NAMESPACE,
+                    container=TETRAGON_CONTAINER,
+                    follow=True,
+                    timestamps=False,
+                    tail_lines=0,
+                    _preload_content=False,
+                )
 
-def main():
-    cfg(); api=client.CoreV1Api(); started=set()
+                for raw_line in response.stream():
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    try:
+                        result = http.post(
+                            SOC_API_URL,
+                            params={"cluster": CLUSTER_NAME},
+                            json=event,
+                        )
+                        result.raise_for_status()
+                    except Exception as exc:
+                        print(f"{pod_name}: forward failed: {exc}", flush=True)
+
+            except Exception as exc:
+                print(f"{pod_name}: stream disconnected: {exc}; reconnecting", flush=True)
+                time.sleep(2)
+
+
+def main() -> None:
+    load_config()
+    api = client.CoreV1Api()
+    started: set[str] = set()
+
     while True:
         try:
-            pods=api.list_namespaced_pod(NS,label_selector=LABEL).items
-            for p in pods:
-                name=p.metadata.name
-                if p.status.phase=="Running" and name not in started:
-                    threading.Thread(target=stream_pod,args=(name,),daemon=True).start(); started.add(name)
-            time.sleep(10)
-        except Exception as ex:
-            print("discovery error",ex,flush=True); time.sleep(5)
-if __name__=="__main__":main()
+            pods = api.list_namespaced_pod(
+                namespace=TETRAGON_NAMESPACE,
+                label_selector=TETRAGON_LABEL,
+            ).items
+
+            running = {
+                pod.metadata.name
+                for pod in pods
+                if pod.status.phase == "Running" and pod.metadata.name
+            }
+
+            for pod_name in sorted(running - started):
+                threading.Thread(
+                    target=stream_pod,
+                    args=(pod_name,),
+                    daemon=True,
+                ).start()
+                started.add(pod_name)
+
+            # Permit recreation of a DaemonSet pod with a new name.
+            started.intersection_update(running)
+            time.sleep(5)
+        except Exception as exc:
+            print(f"Tetragon pod discovery error: {exc}", flush=True)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
